@@ -18,12 +18,20 @@ the conversation flow.
 """
 
 import asyncio
+import datetime
+import io
+import json
+import logging
 import os
 import sys
+import uuid
+import wave
 
+import aiofiles
 import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
+from metrics_logger import MetricsLogger
 from PIL import Image
 from runner import configure
 
@@ -39,6 +47,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
+from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
@@ -49,10 +58,14 @@ load_dotenv(override=True)
 logger.remove(0)
 logger.add(sys.stderr, level="DEBUG")
 
+# Near the top, add this to capture metrics in logs
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+
 sprites = []
 script_dir = os.path.dirname(__file__)
 
-# Load sequential animation frames
 for i in range(1, 26):
     # Build the full path to the image file
     full_path = os.path.join(script_dir, f"assets/robot0{i}.png")
@@ -103,7 +116,51 @@ class TalkingAnimation(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-async def main():
+# Create directories
+os.makedirs("recordings", exist_ok=True)
+os.makedirs("session_data", exist_ok=True)
+
+
+# Function to update session data in the persistent server
+async def update_server_session_data(session_id: str, speaker_type: str, filename: str):
+    """Update session data on the persistent server via API call."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = f"http://localhost:{os.getenv('FAST_API_PORT', '7860')}/api/sessions/{session_id}/recordings"
+            params = {"speaker_type": speaker_type, "filename": filename}
+            async with session.post(url, params=params) as response:
+                if response.status == 200:
+                    print(f"Successfully updated server with recording: {filename}")
+                else:
+                    print(f"Failed to update server. Status: {response.status}")
+    except Exception as e:
+        print(f"Error updating server session data: {e}")
+
+
+async def save_audio(session_id, speaker_type, audio, sample_rate, num_channels):
+    """Save audio data to a WAV file with timestamp and speaker type."""
+    if len(audio) > 0:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"recordings/{session_id}_{speaker_type}_{timestamp}.wav"
+
+        with io.BytesIO() as buffer:
+            with wave.open(buffer, "wb") as wf:
+                wf.setsampwidth(2)
+                wf.setnchannels(num_channels)
+                wf.setframerate(sample_rate)
+                wf.writeframes(audio)
+            async with aiofiles.open(filename, "wb") as file:
+                await file.write(buffer.getvalue())
+
+        # Update the persistent server with the new recording
+        await update_server_session_data(session_id, speaker_type, filename)
+
+        return filename
+
+    return None
+
+
+async def main(room_url, token):
     """Main bot execution function.
 
     Sets up and runs the bot pipeline including:
@@ -113,6 +170,7 @@ async def main():
     - Animation processing
     - RTVI event handling
     """
+    global transport
     async with aiohttp.ClientSession() as session:
         (room_url, token) = await configure(session)
 
@@ -183,6 +241,12 @@ async def main():
         #
         rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
 
+        # Create an audio buffer processor instance
+        audiobuffer = AudioBufferProcessor(enable_turn_audio=True)
+
+        # Initialize metrics logger (without session_id initially)
+        metrics_logger = MetricsLogger()
+
         pipeline = Pipeline(
             [
                 transport.input(),
@@ -191,11 +255,87 @@ async def main():
                 llm,
                 tts,
                 ta,
-                transport.output(),
+                metrics_logger,  # Add metrics logger to pipeline
                 context_aggregator.assistant(),
+                transport.output(),
+                audiobuffer,
             ]
         )
 
+        # When session starts, set session_id on existing metrics logger
+        @transport.event_handler("on_participant_joined")
+        async def on_participant_joined(transport, participant):
+            print(f"📊 Participant {participant['id']} joined. Session: {transport.session_id}")
+
+            # Set session ID on existing metrics logger
+            metrics_logger.session_id = transport.session_id
+            print(f"🔧 Metrics logging initialized for session: {transport.session_id}")
+
+        # When session ends, save metrics
+        @transport.event_handler("on_participant_left")
+        async def on_participant_left(transport, participant, reason):
+            print(f"📊 Participant {participant['id']} left")
+
+            # Save metrics data
+            if metrics_logger and metrics_logger.session_id:
+                metrics_logger.save_session_metrics()
+                print(f"📊 Session metrics saved for: {transport.session_id}")
+
+            try:
+                # print(f"Participant left: {participant}")
+
+                if hasattr(transport, "session_id"):
+                    session_id = transport.session_id
+                    print(f"Processing final audio data for session {session_id}...")
+
+                    # Stop recording to flush any remaining audio data
+                    await audiobuffer.stop_recording()
+
+                    # Give a moment for any pending audio processing to complete
+                    await asyncio.sleep(0.5)
+
+                    # Make a final call to ensure all session data is synced with server
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            url = f"http://localhost:{os.getenv('FAST_API_PORT', '7860')}/api/sessions/{session_id}/recordings"
+                            # This is just a ping to ensure all previous API calls completed
+                            async with session.get(
+                                f"http://localhost:{os.getenv('FAST_API_PORT', '7860')}/api/recordings/{session_id}"
+                            ) as response:
+                                if response.status == 200:
+                                    data = await response.json()
+                                    # print(f"Final session data: {data}")
+                                else:
+                                    print(
+                                        f"Warning: Could not verify session data. Status: {response.status}"
+                                    )
+                    except Exception as e:
+                        print(f"Warning: Error verifying final session data: {e}")
+
+                    print(f"Session {session_id} cleanup completed")
+
+                # Now cancel the pipeline
+                await task.cancel()
+            except Exception as e:
+                print(f"Error in on_participant_left: {e}")
+
+        # Audio recording event handlers
+        @audiobuffer.event_handler("on_audio_data")
+        async def on_audio_data(buffer, audio, sample_rate, num_channels):
+            if hasattr(transport, "session_id"):
+                await save_audio(transport.session_id, "full", audio, sample_rate, num_channels)
+
+        @audiobuffer.event_handler("on_user_turn_audio_data")
+        async def on_user_turn_audio_data(buffer, audio, sample_rate, num_channels):
+            if hasattr(transport, "session_id"):
+                await save_audio(transport.session_id, "user", audio, sample_rate, num_channels)
+
+        @audiobuffer.event_handler("on_bot_turn_audio_data")
+        async def on_bot_turn_audio_data(buffer, audio, sample_rate, num_channels):
+            if hasattr(transport, "session_id"):
+                await save_audio(transport.session_id, "bot", audio, sample_rate, num_channels)
+
+        runner = PipelineRunner()
         task = PipelineTask(
             pipeline,
             params=PipelineParams(
@@ -210,23 +350,27 @@ async def main():
         @rtvi.event_handler("on_client_ready")
         async def on_client_ready(rtvi):
             await rtvi.set_bot_ready()
-            # Kick off the conversation
-            await task.queue_frames([context_aggregator.user().get_context_frame()])
 
         @transport.event_handler("on_first_participant_joined")
         async def on_first_participant_joined(transport, participant):
-            print(f"Participant joined: {participant}")
+            print("Participant joined: ", participant)
+            session_id = str(uuid.uuid4())
+            transport.session_id = session_id
+            await audiobuffer.start_recording()
+            print(f"Created session ID: {session_id}")
             await transport.capture_participant_transcription(participant["id"])
-
-        @transport.event_handler("on_participant_left")
-        async def on_participant_left(transport, participant, reason):
-            print(f"Participant left: {participant}")
-            await task.cancel()
-
-        runner = PipelineRunner()
+            await task.queue_frames([context_aggregator.user().get_context_frame()])
 
         await runner.run(task)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Start the chatbot")
+    parser.add_argument("-u", "--url", help="Daily room URL")
+    parser.add_argument("-t", "--token", help="Daily room token")
+    args = parser.parse_args()
+
+    # Just run the bot logic
+    asyncio.run(main(args.url, args.token))
